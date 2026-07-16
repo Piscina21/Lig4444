@@ -13,6 +13,10 @@ public class ColumnClickHandler : MonoBehaviour
 
     private void OnClick()
     {
+        if (GameManager.Instance.OnlineMode &&
+            GameManager.Instance.CurrentPlayer != GameManager.Instance.LocalPlayer)
+            return;
+
         GameManager.Instance.TryMakeMove(columnIndex);
     }
 }

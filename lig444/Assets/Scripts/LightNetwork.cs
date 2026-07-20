@@ -1,237 +1,215 @@
-using UnityEngine;
-using TMPro;
 using System;
+using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using System.Collections.Generic;
+using UnityEngine;
 
 public class LightNetwork : MonoBehaviour
 {
-    public static LightNetwork Instance;
+    public static LightNetwork Instance { get; private set; }
 
-    [Header("Rede")]
-    public bool isServer;
-    public string serverIP = "127.0.0.1";
-    public int port = 7777;
+    [Header("Network Settings")]
+    [SerializeField] private string serverIP = "127.0.0.1";
+    [SerializeField] private int port = 5555;
+    [SerializeField] private bool isHost = true;
 
-    [Header("Interface")]
-    public TMP_Text logText;
-
-    private TcpListener listener;
-    private TcpClient client;
+    private TcpListener tcpListener;
+    private TcpClient socketConnection;
     private NetworkStream stream;
+    private Thread clientReceiveThread;
 
-    private Thread networkThread;
-    private Thread receiveThread;
-
-    private readonly Queue<string> messages = new();
-    private readonly Queue<Action> actions = new();
-
-    public bool IsConnected
-    {
-        get
-        {
-            return client != null && client.Connected;
-        }
-    }
+    // Fila para transferir execuções da Thread do Socket para a Main Thread da Unity
+    private readonly ConcurrentQueue<Action> mainThreadActions = new ConcurrentQueue<Action>();
 
     private void Awake()
     {
-        Instance = this;
+        if (Instance == null)
+        {
+            Instance = this;
+            DontDestroyOnLoad(gameObject);
+        }
+        else
+        {
+            Destroy(gameObject);
+        }
     }
 
     private void Start()
     {
-        GameManager.Instance.OnlineMode = true;
-
-        if (isServer)
+        // Ativa o modo online no GameManager
+        if (GameManager.Instance != null)
         {
-            GameManager.Instance.LocalPlayer = Player.Red;
+            GameManager.Instance.OnlineMode = true;
+        }
 
-            networkThread = new Thread(StartServer);
-            networkThread.IsBackground = true;
-            networkThread.Start();
+        if (isHost)
+        {
+            // Host joga de Vermelho e inicia o servidor
+            if (GameManager.Instance != null) GameManager.Instance.LocalPlayer = Player.Red;
+            StartServer();
         }
         else
         {
-            GameManager.Instance.LocalPlayer = Player.Yellow;
-
-            networkThread = new Thread(StartClient);
-            networkThread.IsBackground = true;
-            networkThread.Start();
-        }
-    }
-
-    private void StartServer()
-    {
-        try
-        {
-            AddMessage("Servidor iniciado");
-            Debug.Log("Servidor iniciado");
-
-            listener = new TcpListener(IPAddress.Any, port);
-            listener.Start();
-
-            AddMessage("Esperando conexão...");
-            Debug.Log("Esperando conexão...");
-
-            client = listener.AcceptTcpClient();
-
-            stream = client.GetStream();
-
-            AddMessage("Cliente conectado!");
-            Debug.Log("Cliente conectado!");
-
-            StartReceiveThread();
-        }
-        catch (Exception e)
-        {
-            AddMessage("Erro: " + e.Message);
-            Debug.LogError(e);
-        }
-    }
-
-    private void StartClient()
-    {
-        try
-        {
-            AddMessage("Conectando...");
-            Debug.Log("Tentando conectar...");
-
-            client = new TcpClient();
-            client.Connect(serverIP, port);
-
-            stream = client.GetStream();
-
-            AddMessage("Conectado!");
-            Debug.Log("Conectado ao servidor!");
-
-            StartReceiveThread();
-        }
-        catch (Exception e)
-        {
-            AddMessage("Falha ao conectar: " + e.Message);
-            Debug.LogError(e);
-        }
-    }
-
-    private void StartReceiveThread()
-    {
-        receiveThread = new Thread(ReceiveLoop);
-        receiveThread.IsBackground = true;
-        receiveThread.Start();
-    }
-
-    private void ReceiveLoop()
-    {
-        byte[] buffer = new byte[1024];
-
-        while (true)
-        {
-            try
-            {
-                int size = stream.Read(buffer, 0, buffer.Length);
-
-                if (size <= 0)
-                    continue;
-
-                string msg = Encoding.UTF8.GetString(buffer, 0, size);
-
-                AddMessage("Recebido: " + msg);
-                Debug.Log("Recebido: " + msg);
-
-                // PROCESSA A MENSAGEM
-                HandleMessage(msg);
-            }
-            catch
-            {
-                break;
-            }
-        }
-    }
-
-    private void HandleMessage(string msg)
-    {
-        if (msg.StartsWith("MOVE:"))
-        {
-            int column = int.Parse(msg.Substring(5));
-
-            MainThreadAction(() =>
-            {
-                GameManager.Instance.TryMakeMove(column, true);
-            });
-        }
-    }
-
-    public void SendMove(int column)
-    {
-        Send("MOVE:" + column);
-    }
-
-    private void Send(string msg)
-    {
-        if (!IsConnected)
-            return;
-
-        byte[] data = Encoding.UTF8.GetBytes(msg);
-
-        stream.Write(data, 0, data.Length);
-
-        AddMessage("Enviado: " + msg);
-        Debug.Log("Enviado: " + msg);
-    }
-
-    private void MainThreadAction(Action action)
-    {
-        lock (actions)
-        {
-            actions.Enqueue(action);
-        }
-    }
-
-    private void AddMessage(string msg)
-    {
-        lock (messages)
-        {
-            messages.Enqueue(msg);
+            // Cliente joga de Amarelo e se conecta ao host
+            if (GameManager.Instance != null) GameManager.Instance.LocalPlayer = Player.Yellow;
+            ConnectToServer();
         }
     }
 
     private void Update()
     {
-        lock (messages)
+        // Executa todas as mensagens/jogadas pendentes na Thread principal da Unity
+        while (mainThreadActions.TryDequeue(out Action action))
         {
-            while (messages.Count > 0)
-            {
-                string msg = messages.Dequeue();
-
-                if (logText != null)
-                    logText.text += "\n" + msg;
-            }
+            action?.Invoke();
         }
+    }
 
-        lock (actions)
+    #region --- SERVIDOR & CONEXÃO ---
+
+    private void StartServer()
+    {
+        try
         {
-            while (actions.Count > 0)
+            clientReceiveThread = new Thread(() =>
             {
-                actions.Dequeue().Invoke();
+                tcpListener = new TcpListener(IPAddress.Any, port);
+                tcpListener.Start();
+                Debug.Log($"Servidor aguardando conexões na porta {port}...");
+
+                socketConnection = tcpListener.AcceptTcpClient();
+                Debug.Log("Cliente conectado!");
+
+                stream = socketConnection.GetStream();
+                ListenForData();
+            });
+
+            clientReceiveThread.IsBackground = true;
+            clientReceiveThread.Start();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Erro ao iniciar o servidor TCP: {e.Message}");
+        }
+    }
+
+    private void ConnectToServer()
+    {
+        try
+        {
+            clientReceiveThread = new Thread(() =>
+            {
+                socketConnection = new TcpClient(serverIP, port);
+                Debug.Log("Conectado com sucesso ao Servidor!");
+
+                stream = socketConnection.GetStream();
+                ListenForData();
+            });
+
+            clientReceiveThread.IsBackground = true;
+            clientReceiveThread.Start();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Erro ao conectar ao servidor TCP: {e.Message}");
+        }
+    }
+
+    #endregion
+
+    #region --- RECEBIMENTO & ENVIO ---
+
+    private void ListenForData()
+    {
+        byte[] bytes = new byte[1024];
+        while (socketConnection != null && socketConnection.Connected)
+        {
+            try
+            {
+                int length;
+                if (stream != null && (length = stream.Read(bytes, 0, bytes.Length)) != 0)
+                {
+                    string incomingMessage = Encoding.UTF8.GetString(bytes, 0, length).Trim();
+                    ProcessMessage(incomingMessage);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Conexão encerrada ou erro de leitura: {ex.Message}");
+                break;
             }
         }
     }
 
+    private void ProcessMessage(string message)
+    {
+        // Formato esperado de jogada: "MOVE:coluna" (Ex: "MOVE:3")
+        if (message.StartsWith("MOVE:"))
+        {
+            string[] parts = message.Split(':');
+            if (parts.Length > 1 && int.TryParse(parts[1], out int columnIndex))
+            {
+                // Enfileira a jogada para rodar dentro da Unity Main Thread
+                mainThreadActions.Enqueue(() =>
+                {
+                    GameManager.Instance.TryMakeMove(columnIndex, receivedFromNetwork: true);
+                });
+            }
+        }
+    }
+
+    public void SendMove(int columnIndex)
+    {
+        if (socketConnection == null || !socketConnection.Connected)
+        {
+            Debug.LogWarning("Não há conexão ativa para enviar o movimento.");
+            return;
+        }
+
+        try
+        {
+            if (stream.CanWrite)
+            {
+                string clientMessage = $"MOVE:{columnIndex}\n";
+                byte[] clientMessageAsByteArray = Encoding.UTF8.GetBytes(clientMessage);
+                stream.Write(clientMessageAsByteArray, 0, clientMessageAsByteArray.Length);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Erro ao enviar dados via TCP: {e.Message}");
+        }
+    }
+
+    #endregion
+
+    private void OnApplicationQuit()
+    {
+        CloseConnection();
+    }
+
     private void OnDestroy()
+    {
+        CloseConnection();
+    }
+
+    private void CloseConnection()
     {
         try
         {
-            receiveThread?.Abort();
-            networkThread?.Abort();
-        }
-        catch { }
+            if (clientReceiveThread != null && clientReceiveThread.IsAlive)
+                clientReceiveThread.Abort();
 
-        stream?.Close();
-        client?.Close();
-        listener?.Stop();
+            stream?.Close();
+            socketConnection?.Close();
+            tcpListener?.Stop();
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"Erro ao fechar conexão: {e.Message}");
+        }
     }
 }
